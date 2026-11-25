@@ -1,10 +1,7 @@
-"""Aplicación deliberadamente vulnerable para la evaluación OCY1102 EV3.
-
-Solo debe ejecutarse en el laboratorio local. El alumnado debe revisar y corregir
-los defectos; estos comentarios no enumeran las respuestas de la evaluación.
-"""
+"""Aplicación asegurada para la evaluación OCY1102 EV3."""
 
 import os
+import secrets
 import sqlite3
 import time
 from pathlib import Path
@@ -32,7 +29,10 @@ LOGIN_FAILURES = Counter(
 
 def create_app(database_path=None):
     app = Flask(__name__)
-    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "clave-insegura-solo-laboratorio")
+    # 1. Clave secreta fuerte y configuración segura de cookies
+    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or secrets.token_hex(32)
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.config["DATABASE_PATH"] = str(
         database_path or os.getenv("DATABASE_PATH", str(Path(__file__).with_name("securedev.db")))
     )
@@ -49,16 +49,44 @@ def create_app(database_path=None):
         if connection is not None:
             connection.close()
 
-    @app.before_request
-    def start_request_timer():
-        g.request_started_at = time.perf_counter()
+    # 2. Generador de token Anti-CSRF disponible en todas las plantillas Jinja2
+    def get_csrf_token():
+        if "csrf_token" not in session:
+            session["csrf_token"] = secrets.token_hex(32)
+        return session["csrf_token"]
 
+    app.jinja_env.globals["csrf_token"] = get_csrf_token
+
+    # 3. Validación Anti-CSRF en todas las peticiones POST
+    @app.before_request
+    def start_request_timer_and_verify_csrf():
+        g.request_started_at = time.perf_counter()
+        if request.method == "POST":
+            token = request.form.get("csrf_token", "")
+            session_token = session.get("csrf_token", "")
+            if not token or not session_token or not secrets.compare_digest(token, session_token):
+                abort(403)
+
+    # 4. Cabeceras de seguridad HTTP (remedia alertas Medium y Low de OWASP ZAP)
     @app.after_request
-    def record_request(response):
+    def record_request_and_set_security_headers(response):
         if request.endpoint != "metrics":
             endpoint = request.endpoint or "unknown"
             HTTP_REQUESTS.labels(endpoint, request.method, str(response.status_code)).inc()
             HTTP_DURATION.labels(endpoint).observe(time.perf_counter() - g.request_started_at)
+
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'self'"
+        )
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Server"] = "SecureServer"
         return response
 
     with app.app_context():
@@ -127,6 +155,7 @@ def create_app(database_path=None):
                 session.clear()
                 session["user_id"] = user["id"]
                 session["username"] = user["username"]
+                session["csrf_token"] = secrets.token_hex(32)
                 return redirect(url_for("index"))
             LOGIN_FAILURES.inc()
             error = "Credenciales inválidas"
@@ -146,6 +175,9 @@ def create_app(database_path=None):
         ).fetchone()
         if item is None:
             abort(404)
+        # 5. Control de acceso (remedia IDOR)
+        if item["owner_id"] != current_user():
+            abort(403)
         comments = db().execute(
             "SELECT body FROM comments WHERE ticket_id = ? ORDER BY id", (ticket_id,)
         ).fetchall()
@@ -155,14 +187,21 @@ def create_app(database_path=None):
     def add_comment(ticket_id):
         if not current_user():
             return redirect(url_for("login"))
-        if db().execute("SELECT id FROM tickets WHERE id = ?", (ticket_id,)).fetchone() is None:
+        item = db().execute(
+            "SELECT id, owner_id FROM tickets WHERE id = ?", (ticket_id,)
+        ).fetchone()
+        if item is None:
             abort(404)
-        body = request.form.get("body", "")
-        db().execute(
-            "INSERT INTO comments (ticket_id, author_id, body) VALUES (?, ?, ?)",
-            (ticket_id, current_user(), body),
-        )
-        db().commit()
+        # Control de acceso (remedia IDOR en comentarios)
+        if item["owner_id"] != current_user():
+            abort(403)
+        body = request.form.get("body", "").strip()
+        if body:
+            db().execute(
+                "INSERT INTO comments (ticket_id, author_id, body) VALUES (?, ?, ?)",
+                (ticket_id, current_user(), body),
+            )
+            db().commit()
         return redirect(url_for("ticket", ticket_id=ticket_id))
 
     @app.get("/search")
@@ -170,8 +209,11 @@ def create_app(database_path=None):
         if not current_user():
             return redirect(url_for("login"))
         query = request.args.get("q", "")
-        sql = f"SELECT id, title FROM tickets WHERE title LIKE '%{query}%' ORDER BY id"
-        tickets = db().execute(sql).fetchall()
+        # 6. Consulta parametrizada + filtro por propietario (remedia SQL Injection e IDOR)
+        tickets = db().execute(
+            "SELECT id, title FROM tickets WHERE owner_id = ? AND title LIKE ? ORDER BY id",
+            (current_user(), f"%{query}%"),
+        ).fetchall()
         return render_template("search.html", tickets=tickets, query=query)
 
     @app.get("/health")
@@ -186,4 +228,4 @@ def create_app(database_path=None):
 
 
 if __name__ == "__main__":
-    create_app().run(host="0.0.0.0", port=8000)
+    create_app().run(host="0.0.0.0", port=8000, debug=False)
