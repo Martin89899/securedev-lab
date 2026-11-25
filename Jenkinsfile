@@ -22,10 +22,11 @@ pipeline {
         stage('OWASP ZAP Baseline Scan') {
             steps {
                 sh '''
-                    docker rm -f zap-scanner || true
-                    docker run --name zap-scanner -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t http://host.docker.internal:8000 -r zap_report_1.html || true
-                    docker cp zap-scanner:/zap/wrk/zap_report_1.html ./zap_report_1.html
-                    docker rm -f zap-scanner || true
+                    docker volume rm zap_reports || true
+                    docker volume create zap_reports
+                    docker run --rm -u root -v zap_reports:/zap/wrk/:rw -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t http://host.docker.internal:8000 -r zap_report_1.html || true
+                    docker run --rm -v zap_reports:/src -v devsecops-tools_jenkins_home:/dst alpine cp /src/zap_report_1.html /dst/workspace/securedev-pipeline/zap_report_1.html
+                    docker volume rm zap_reports || true
                 '''
             }
         }
